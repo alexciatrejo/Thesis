@@ -1,0 +1,260 @@
+# create adjacency matrices per match number 
+
+# 1. Load libraries
+library(dplyr)
+library(readxl)
+library(igraph)
+library(cmdstanr)
+library(bayesplot)
+library(posterior)
+library(ggplot2)
+library(ggraph)
+library(reshape2)
+library(ggrepel)
+library(knitr)
+
+# 2. Load data (uncomment the correct path)
+raw_data_2023 <- read_excel(
+  "C:/Users/trejo/OneDrive/Documents/final code thesis/real data/nba.data.23.24.season.xlsx",
+  sheet = "data"
+)
+# 3. Clean and prepare data
+clean_data <- raw_data_2023 %>%
+  mutate(
+    pair_id = if_else(Team < Opponent,
+                      paste0(Team, "-", Opponent),
+                      paste0(Opponent, "-", Team)
+    ),
+    Margin = as.numeric(`O/U Margin`)
+  ) %>%
+  arrange(Date) %>%
+  group_by(pair_id) %>%
+  mutate(meeting_number = row_number()) %>%
+  ungroup()
+
+# 4. Setup adjacency matrices
+all_teams  <- sort(unique(c(clean_data$Team, clean_data$Opponent)))
+N          <- length(all_teams)
+team_index <- set_names(seq_along(all_teams), all_teams)
+M          <- max(clean_data$meeting_number)
+
+# Initialize list of M adjacency matrices
+adj_list <- replicate(M, matrix(0L, nrow = N, ncol = N), simplify = FALSE)
+
+# Fill adjacency matrices
+for (i in seq_len(nrow(clean_data))) {
+  row        <- clean_data[i, ]
+  idx_i      <- team_index[[row$Team]]
+  idx_j      <- team_index[[row$Opponent]]
+  edge_val   <- as.integer(row$Margin > 0)  # 1 if Over, else 0
+  meeting    <- row$meeting_number
+
+  adj_list[[meeting]][idx_i, idx_j] <- edge_val
+  adj_list[[meeting]][idx_j, idx_i] <- edge_val
+}
+# Ensure no self-edges
+for (m in seq_len(M)) diag(adj_list[[m]]) <- 0L
+
+# 5. Network Plots
+g1 <- graph_from_adjacency_matrix(adj_list[[1]], mode = "undirected", diag = FALSE)
+plot(g1, main = "First Meeting Network") 
+
+if (M >= 2) {
+  g2 <- graph_from_adjacency_matrix(adj_list[[2]], mode = "undirected", diag = FALSE)
+  plot(g2, main = "Second Meeting Network")
+}
+
+# 6. Covariate matrix (offensice stats only)
+cov_data    <- read_excel("C:/Users/trejo/Downloads/archive/oddsData.xlsx", sheet = "cov")
+cov_matrix  <- as.matrix(cov_data[, c("PPG", "FG%", "3P%", "FT%")])
+# Check dimensions: should be N x P (30 x 4)
+dim(cov_matrix)
+
+# 7. Stan setup and sampling
+# Prepare data for Stan
+K      <- 2  # latent dimension
+prior  <- list(a_sig = 3, b_sig = 1, a_k = 3, b_k = 1, a_w = 3, b_w = 1)
+
+stan_data <- list(
+  N     = N,
+  K     = K,
+  P     = ncol(cov_matrix),
+  Y     = adj_list[[1]],   # use first meeting
+  X     = cov_matrix,
+  a_sig = prior$a_sig,
+  b_sig = prior$b_sig,
+  a_k   = prior$a_k,
+  b_k   = prior$b_k,
+  a_w   = prior$a_w,
+  b_w   = prior$b_w
+)
+
+# Compile Stan model
+model_path     <- "C:/Users/trejo/OneDrive/Documents/final code thesis/stan models/coveigenattempt.stan"
+eigencov_model <- cmdstan_model(model_path)
+
+# Sample
+fit_eigencov <- eigencov_model$sample(
+  data        = stan_data,
+  seed        = 123,
+  chains      = 3,
+  iter_warmup = 2000,
+  iter_sampling = 5000
+)
+
+# 8. MCMC diagnostics
+summary_df <- fit_eigencov$summary()
+mcmc_rhat(rhat = summary_df$rhat)
+
+draws_df <- as_draws_df(fit_eigencov$draws())
+
+# Trace plots for key parameters
+mcmc_trace(draws_df, pars = c("ZETA", "LAMBDA[1]", "LAMBDA[2]"))
+mcmc_trace(draws_df, pars = paste0("Beta[", 1:4, "]"))
+
+# Effective sample sizes
+ess_vals <- ess_bulk(summary_df)
+
+# 9. Posterior predictive density
+n             <- N
+true_density  <- sum(adj_list[[1]][upper.tri(adj_list[[1]])]) / choose(n, 2)
+
+# Build probability matrix p_mat
+p_mat <- matrix(NA_real_, nrow = N, ncol = N)
+for (i in seq_len(N)) {
+  for (j in seq_len(N)) {
+    theta_nm <- sprintf("THETA[%d,%d]", i, j)
+    p_mat[i, j] <- mean(draws_df[[theta_nm]], na.rm = TRUE)
+  }
+}
+
+pred_df <- data.frame(pred = as.vector(p_mat))
+
+#plot predictive density vs true density
+ggplot(pred_df, aes(x = pred)) +
+  geom_density(alpha = 0.7) +
+  geom_vline(xintercept = true_density, linetype = "dashed", color = "red", size = 1) +
+  labs(title = "Posterior Predictive Density of M1",
+       x = "Predicted Density (M1)", y = "Density") +
+  theme_minimal()
+
+
+# Heatmap & Prediction Accuracy 
+# ------------------------------------------
+
+#2 Convert matrices to long format
+df_pred <- melt(p_mat, varnames = c("Team", "Opponent"), value.name = "Probability")
+df_true <- melt(M2,     varnames = c("Team", "Opponent"), value.name = "TrueOutcome")
+
+#2 Merge predictions and true outcomes
+plot_df <- inner_join(df_pred, df_true, by = c("Team", "Opponent"))
+
+# 3. Plot heatmap of probabilities with 'O' overlay for Over outcomes
+ggplot(plot_df, aes(x = Opponent, y = Team, fill = Probability)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "blue", name = "Pr(Over)") +
+  geom_text(aes(label = ifelse(TrueOutcome == 1, "O", "")), color = "darkblue") +
+  theme_minimal() +
+  labs(
+    title = "Predicted Over Probabilities vs. True M2 Outcomes",
+    x = "Opponent",
+    y = "Team"
+  ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+# 4. Identify high-confidence correct predictions
+# Define thresholds
+high_thr <- 0.6
+low_thr  <- 0.43
+
+# Initialize data frames
+over_matches <- tibble()
+under_matches <- tibble()
+
+# Loop through unique pairs i < j
+i_indices <- combn(seq_along(all_teams), 2)
+for (k in seq_len(ncol(i_indices))) {
+  i <- i_indices[1, k]
+  j <- i_indices[2, k]
+  prob  <- p_mat[i, j]
+  truth <- M2[i, j]
+  team  <- all_teams[i]
+  opp   <- all_teams[j]
+
+  if (prob >= high_thr && truth == 1) {
+    over_matches <- add_row(over_matches,
+      Team = team,
+      Opponent = opp,
+      Predicted = prob,
+      TrueOutcome = truth
+    )
+  }
+  if (prob <= low_thr && truth == 0) {
+    under_matches <- add_row(under_matches,
+      Team = team,
+      Opponent = opp,
+      Predicted = prob,
+      TrueOutcome = truth
+    )
+  }
+}
+
+# Display results
+cat("Correct Over Predictions:\n")
+print(over_matches)
+cat("\nCorrect Under Predictions:\n")
+print(under_matches)
+
+# 5. Compute dominant correct prediction label per team
+# Count occurrences
+over_counts  <- count(over_matches,  Team)
+under_counts <- count(under_matches, Team)
+
+latent_means <- latent_means %>%
+  left_join(over_counts,  by = c("team" = "Team")) %>%
+  left_join(under_counts, by = c("team" = "Team")) %>%
+  mutate(
+    n = replace_na(n, 0),
+    n.x = replace_na(n.x, 0),
+    correct_over  = n.x,
+    correct_under = n,
+    pred_label = case_when(
+      correct_over > correct_under ~ "Over",
+      correct_under > correct_over ~ "Under",
+      TRUE                         ~ "Mixed"
+    )
+  )
+
+# 6. Plot latent embedding colored by pred_label
+ggplot(latent_means, aes(x = U1, y = U2, color = pred_label)) +
+  geom_point(size = 4) +
+  geom_text_repel(aes(label = team), size = 3) +
+  scale_color_manual(values = c("Over" = "green", "Under" = "red", "Mixed" = "grey")) +
+  theme_minimal() +
+  labs(
+    title = "Latent Embedding: Dominant Correct Prediction by Team",
+    x = "Latent Dimension 1",
+    y = "Latent Dimension 2",
+    color = "Prediction Label"
+  )
+
+# 7. Plot clusters with prediction labels and convex hulls
+library(cluster)
+num_clusters <- length(unique(latent_means$cluster))
+hulls <- latent_means %>%
+  group_by(cluster) %>%
+  slice(chull(U1, U2)) %>%
+  ungroup()
+
+ggplot(latent_means, aes(x = U1, y = U2)) +
+  geom_polygon(data = hulls, aes(fill = cluster, group = cluster), alpha = 0.2) +
+  geom_point(aes(color = pred_label, shape = cluster), size = 4) +
+  geom_text_repel(aes(label = team), size = 3) +
+  scale_fill_brewer(palette = "Pastel1", name = "Cluster") +
+  scale_color_manual(values = c("Over" = "green", "Under" = "red", "Mixed" = "grey")) +
+  theme_minimal() +
+  labs(
+    title = "Latent Embedding with Clusters & Prediction Labels",
+    x = "Latent Dimension 1",
+    y = "Latent Dimension 2"
+  )
